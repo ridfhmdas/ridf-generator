@@ -4,3 +4,4 @@ tinydb
 pandas
 matplotlib
 xlsxwriter
+io
