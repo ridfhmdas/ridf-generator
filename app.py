@@ -807,7 +807,7 @@ with tab1:
                         st.download_button(
                             label="📥 Download Updated HMDAS-14",
                             data=h14_buffer.getvalue(),
-                            file_name=f"HMDAS-14_{station_val}_{month_abbr}_{year_val}.xlsm",
+                            file_name=f"HMDAS-14 {stn_name} {year_month}.xlsm",
                             mime="application/vnd.ms-excel.sheet.macroEnabled.12"
                         )
 
@@ -827,7 +827,7 @@ with tab2:
     st.info("Upload multiple HMDAS-14 files (different months) to compile the annual summary.")
     
     annual_files = st.file_uploader(
-        "Upload HMDAS-14 Files (e.g., Catarman 202110.xlsm)", 
+        "Upload HMDAS-14 Files", 
         type=["xlsm"], 
         accept_multiple_files=True,
         key=f"annual_up_{st.session_state['uploader_key']}"
@@ -836,37 +836,33 @@ with tab2:
     from openpyxl.styles import PatternFill, Border, Side
 
     if annual_files:
-        # --- VALIDATION LOGIC ---
-        # Matches: HMDAS-14_[Station]_[Month]_[Year].xlsm
-        name_pattern = r"HMDAS-14_(.+)_([A-Z]{3})_(\d{4})"
+        # 1. VALIDATION LOGIC
+        # Matches: "HMDAS-14 [StationName] [YYYYMM].xlsm"
+        name_pattern = r"HMDAS-14\s+(.+)\s+(\d{4})\d{2}"
         batch_meta = []
         is_valid_batch = True
 
         for f in annual_files:
             match = re.search(name_pattern, f.name)
             if not match:
-                st.error(f"❌ **Naming Error:** `{f.name}` does not follow the HMDAS-14 convention.")
+                st.error(f"❌ **Naming Error:** `{f.name}` must be `HMDAS-14 StationName YYYYMM.xlsm`")
                 is_valid_batch = False
                 break
             
-            station, month, year = match.groups()
-            batch_meta.append({'station': station.strip(), 'year': year, 'name': f.name})
+            stn_name, year_val = match.groups()
+            batch_meta.append({'station': stn_name.strip(), 'year': year_val, 'name': f.name})
 
         if is_valid_batch:
-            first_file = batch_meta[0]
-            mismatched_station = [m['name'] for m in batch_meta if m['station'] != first_file['station']]
-            mismatched_year = [m['name'] for m in batch_meta if m['year'] != first_file['year']]
-
-            if mismatched_station:
-                st.error(f"🛑 **Station Mismatch!** Found different stations. All files must be from `{first_file['station']}`.")
+            first = batch_meta[0]
+            if any(m['station'] != first['station'] for m in batch_meta):
+                st.error(f"🛑 **Station Mismatch!** All files must be from {first['station']}.")
                 is_valid_batch = False
-            elif mismatched_year:
-                st.error(f"🛑 **Year Mismatch!** Found multiple years. All files must be from `{first_file['year']}`.")
+            elif any(m['year'] != first['year'] for m in batch_meta):
+                st.error(f"🛑 **Year Mismatch!** All files must be from year {first['year']}.")
                 is_valid_batch = False
 
         if is_valid_batch:
             st.success(f"✅ **Validated Batch:** {batch_meta[0]['station']} | Year: {batch_meta[0]['year']}")
-            st.session_state['h15_complete'] = True
             
             current_station = batch_meta[0]['station']
             current_year = batch_meta[0]['year']
@@ -877,60 +873,73 @@ with tab2:
                     wb_h15 = load_workbook(HMDAS15_TEMPLATE_PATH, keep_vba=True)
                     ws_summary = wb_h15.active
                     
-                    # --- NEW UPDATES: Cells & Sheet Name ---
-                    # 1. Update Sheet Title (Tab Name)
+                    # Update Cells & Tab Name
                     ws_summary.title = f"{current_year} {current_station} Max Summary"
-                    
-                    # 2. Update Cell A2
                     ws_summary['A2'].value = f"{current_station} Synop Station"
-                    
-                    # 3. Update Cell O18
                     ws_summary['O18'].value = f"{current_year} Annual Max per Duration"
                     
-                    # --- STYLING ---
                     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
                     thick_border_side = Side(style='medium')
                     month_separator = Border(bottom=thick_border_side)
                     
+                    # Standard intervals for HMDAS-15
                     lookback_steps = [1, 2, 3, 6, 12, 18, 36, 72, 144]
 
                     for uploaded_file in annual_files:
-                        wb_h14 = load_workbook(uploaded_file, data_only=False) 
-                        date_pattern = re.compile(r"^\d{2}\s[A-Z]{3}\s\d{4}$")
+                        # Load workbook (No data_only=True needed as we are recomputing from scratch)
+                        wb_h14 = load_workbook(uploaded_file) 
+                        
+                        # Updated regex: Case-insensitive and handles potential extra spaces
+                        date_pattern = re.compile(r"^\d{2}\s[A-Z]{3}\s\d{4}$", re.IGNORECASE)
                         
                         for sheet_name in wb_h14.sheetnames:
-                            if date_pattern.match(sheet_name):
+                            clean_name = sheet_name.strip()
+                            if date_pattern.match(clean_name):
                                 ws_day = wb_h14[sheet_name]
+                                
+                                # --- RECOMPUTATION LOGIC ---
                                 b1_val = ws_day["B1"].value
                                 multiplier = float(b1_val) if b1_val is not None else 1.0
 
-                                col_c_data = []
+                                # Extract Column B (Precipitation)
+                                col_b_raw = []
                                 for r in range(3, 148):
                                     val = ws_day.cell(row=r, column=2).value
                                     try:
-                                        col_c_data.append((float(val) if val is not None else 0.0) * multiplier)
+                                        col_b_raw.append(float(val) if val is not None else 0.0)
                                     except:
-                                        col_c_data.append(0.0)
+                                        col_b_raw.append(0.0)
 
+                                # Calculate intensities
                                 intensity_maxes = []
                                 for lookback in lookback_steps:
                                     max_val = 0.0
-                                    for i in range(lookback, len(col_c_data)):
-                                        diff = col_c_data[i] - col_c_data[i - lookback]
+                                    for i in range(lookback, len(col_b_raw)):
+                                        # (Current - Previous) * Multiplier
+                                        diff = (col_b_raw[i] - col_b_raw[i - lookback]) * multiplier
                                         if diff > max_val:
                                             max_val = diff
                                     intensity_maxes.append(round(max_val, 1))
 
+                                # --- DATE HANDLING (Handle UPPER/Lower month names) ---
+                                try:
+                                    parts = clean_name.split()
+                                    # Normalize month to Title Case (e.g., OCT -> Oct) for strptime
+                                    norm_name = f"{parts[0]} {parts[1].capitalize()} {parts[2]}"
+                                    date_obj = datetime.strptime(norm_name, "%d %b %Y")
+                                except:
+                                    continue
+
                                 extracted_data.append({
-                                    "date_obj": datetime.strptime(sheet_name, "%d %b %Y"),
-                                    "label": sheet_name,
+                                    "date_obj": date_obj,
+                                    "label": clean_name.upper(),
                                     "values": intensity_maxes
                                 })
 
                     # Sort Chronologically
                     extracted_data.sort(key=lambda x: x['date_obj'])
                     
-                    # 4. Injection Loop
+                    # 4. Inject into HMDAS-15
                     last_month = None
                     for idx, entry in enumerate(extracted_data, 1):
                         target_row = 3 + idx
@@ -946,18 +955,16 @@ with tab2:
                             if val > 30:
                                 cell.fill = red_fill
                         
-                        # Apply monthly separator
                         if last_month is not None and current_month != last_month:
                             for col in range(1, 13):
                                 ws_summary.cell(row=target_row - 1, column=col).border = month_separator
                         last_month = current_month
 
-                    # 5. Save & Download
                     output_fn = f"HMDAS-15 {current_station} {current_year}.xlsm"
                     h15_buffer = io.BytesIO()
                     wb_h15.save(h15_buffer)
                     
-                    st.success(f"✅ Processed successfully: {ws_summary.title}")
+                    st.success(f"✅ Processed {len(extracted_data)} days into {ws_summary.title}")
                     st.download_button(
                         label=f"📥 Download {output_fn}",
                         data=h15_buffer.getvalue(),
